@@ -123,9 +123,9 @@ export function useBoleteriaPolling(
     }
   }, [settingsKey])
 
-  const pollOnce = useCallback(async () => {
-    if (!enabled || !settingsAreComplete(settings)) return
+  const pollingRef = useRef(false)
 
+  const pollPass = useCallback(async () => {
     const supabase = getSupabase(settings)
     const { rows, error } = await fetchFisicoTickets(supabase)
     const now = Date.now()
@@ -167,11 +167,19 @@ export function useBoleteriaPolling(
         if (!currentIds.has(id)) {
           lines.push(`Salio de cola: ${shortId(id)}`)
           prev.delete(id)
-          printedRef.current.delete(id)
         }
       }
-      if (printedRef.current.size) savePrintedSet(printedRef.current)
     }
+
+    // Lo que ya no está en cola quedó confirmado (fisico=false); si vuelve a la cola, se reimprime.
+    let pruned = false
+    for (const id of [...printedRef.current]) {
+      if (!currentIds.has(id)) {
+        printedRef.current.delete(id)
+        pruned = true
+      }
+    }
+    if (pruned) savePrintedSet(printedRef.current)
 
     if (lines.length) appendActivity(lines)
 
@@ -187,6 +195,21 @@ export function useBoleteriaPolling(
     const toPrint = rows.filter((row) => !printed.has(row.id))
 
     if (printerConfigured(settings) && !delegateNativeBackgroundPrint) {
+      if (Capacitor.isNativePlatform()) {
+        // Impresos cuya marca fisico=false falló: solo se reintenta la marca, nunca se reimprimen.
+        for (const row of rows) {
+          if (!printed.has(row.id)) continue
+          const ack = await ackTicketPrinted(supabase, row)
+          if (!ack.ok) {
+            setState((s) => ({
+              ...s,
+              lastError: `Boleto ${row.shortCode || shortId(row.id)} impreso pero sin marcar en la base: ${ack.error?.message ?? 'sin permiso de UPDATE'}`,
+            }))
+            break
+          }
+        }
+      }
+
       let markedPrinted = false
       for (const row of toPrint) {
         const preview = buildBoleteriaTicketPreview(row)
@@ -212,12 +235,13 @@ export function useBoleteriaPolling(
         }
         try {
           await printBoleteriaTicketEscPos(settings.printerHost, settings.printerPort, row)
-          const ack = await ackTicketPrinted(supabase, row)
-          if (!ack.ok) {
-            throw ack.error ?? new Error('No se pudo confirmar impresión (fisico).')
-          }
           printed.add(row.id)
+          savePrintedSet(printed)
           markedPrinted = true
+          const ack = await ackTicketPrinted(supabase, row)
+          const ackError = ack.ok
+            ? undefined
+            : `Impreso, pero no se pudo marcar fisico=false (${ack.error?.message ?? 'sin permiso de UPDATE'}). No se reimprime; se reintenta marcarlo.`
           const entry: PrintedBoletoLog = {
             id: newActivityId(),
             at: Date.now(),
@@ -226,9 +250,11 @@ export function useBoleteriaPolling(
             status: 'printed',
             preview,
             ticket: row,
+            error: ackError,
           }
           setState((s) => ({
             ...s,
+            lastError: ackError ?? s.lastError,
             printedLogs: [entry, ...s.printedLogs].slice(0, MAX_PRINT_LOGS),
           }))
         } catch (e) {
@@ -254,7 +280,19 @@ export function useBoleteriaPolling(
       }
       if (markedPrinted) savePrintedSet(printed)
     }
-  }, [enabled, settings, appendActivity, delegateNativeBackgroundPrint])
+  }, [settings, appendActivity, delegateNativeBackgroundPrint])
+
+  const pollOnce = useCallback(async () => {
+    if (!enabled || !settingsAreComplete(settings)) return
+    // Imprimir varios boletos tarda más que el intervalo; dos pasadas a la vez duplicarían boletos.
+    if (pollingRef.current) return
+    pollingRef.current = true
+    try {
+      await pollPass()
+    } finally {
+      pollingRef.current = false
+    }
+  }, [enabled, settings, pollPass])
 
   useEffect(() => {
     if (!enabled || !settingsAreComplete(settings)) return

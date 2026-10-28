@@ -18,6 +18,9 @@ export type BoleteriaTicketRow = {
   venue: string
   ticketTypeName: string
   priceCents: number
+  /** Orden de emisión dentro del tipo de entrada (función ticket_print_numbers). */
+  typeNumber: number | null
+  typeCapacity: number | null
 }
 
 type TicketDbRow = {
@@ -77,7 +80,7 @@ export async function fetchFisicoTickets(
   const eventIds = [...new Set(tickets.map((t) => t.eventId).filter(Boolean))]
   const typeIds = [...new Set(tickets.map((t) => t.ticketTypeId).filter(Boolean))]
 
-  const [ordersRes, eventsRes, typesRes] = await Promise.all([
+  const [ordersRes, eventsRes, typesRes, numbersRes] = await Promise.all([
     orderIds.length
       ? supabase
           .from('Order')
@@ -90,11 +93,23 @@ export async function fetchFisicoTickets(
     typeIds.length
       ? supabase.from('TicketType').select('id, name, priceCents').in('id', typeIds)
       : Promise.resolve({ data: [], error: null }),
+    supabase.rpc('ticket_print_numbers', { ticket_ids: tickets.map((t) => t.id) }),
   ])
 
   if (ordersRes.error) return { rows: [], error: new Error(ordersRes.error.message) }
   if (eventsRes.error) return { rows: [], error: new Error(eventsRes.error.message) }
   if (typesRes.error) return { rows: [], error: new Error(typesRes.error.message) }
+  if (numbersRes.error) {
+    return { rows: [], error: new Error(`Número de boleto: ${numbersRes.error.message}`) }
+  }
+
+  const numbers = new Map<string, { typeNumber: number; typeCapacity: number }>()
+  for (const row of (numbersRes.data ?? []) as unknown[]) {
+    const r = asRecord(row)
+    if (r && typeof r.id === 'string') {
+      numbers.set(r.id, { typeNumber: num(r.typeNumber), typeCapacity: num(r.typeCapacity) })
+    }
+  }
 
   const orders = new Map<string, Record<string, unknown>>()
   for (const row of ordersRes.data ?? []) {
@@ -135,6 +150,8 @@ export async function fetchFisicoTickets(
       venue: str(e.venue),
       ticketTypeName: str(tt.name),
       priceCents: num(tt.priceCents, 0),
+      typeNumber: numbers.get(t.id)?.typeNumber ?? null,
+      typeCapacity: numbers.get(t.id)?.typeCapacity ?? null,
     })
   }
 
@@ -158,7 +175,10 @@ export async function ackTicketPrinted(
 
   if (error) return { ok: false, error: new Error(error.message) }
   if (!data || data.length === 0) {
-    return { ok: false, error: new Error('Ticket ya no está en cola (fisico=false).') }
+    return {
+      ok: false,
+      error: new Error('No se actualizó ninguna fila: ya no estaba en cola o falta permiso UPDATE (RLS) en Ticket.'),
+    }
   }
   return { ok: true, error: null }
 }

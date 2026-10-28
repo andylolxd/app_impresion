@@ -31,6 +31,7 @@ function replaceUnicodeSeparatorsForThermal(text: string): string {
     .replace(/\u2027/g, ' | ') // ‧ HYPHENATION POINT
     .replace(/\u30fb/g, ' | ') // ・ KATAKANA MIDDLE DOT
     .replace(/\u0387/g, ' | ') // · GREEK ANO TELEIA
+    .replace(/[\u2013\u2014]/g, '-') // – — guiones
 }
 
 /**
@@ -553,11 +554,16 @@ const PAYMENT_LABEL_BOLETERIA: Record<string, string> = {
   CORTESIA: 'Cortesia',
 }
 
-/** Formatea startsAt / createdAt en zona Mendoza. */
+/**
+ * Formatea startsAt / createdAt en zona Mendoza.
+ * Prisma guarda UTC en `timestamp without time zone` y PostgREST lo devuelve sin offset;
+ * sin la Z, Date.parse lo tomaría como hora local del teléfono.
+ */
 export function formatBoleteriaWhen(iso: string): string {
   const raw = String(iso ?? '').trim()
   if (!raw) return ''
-  const t = Date.parse(raw)
+  const utc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(raw) ? `${raw}Z` : raw
+  const t = Date.parse(utc)
   if (Number.isNaN(t)) {
     return raw.includes('T') ? raw.slice(0, 19).replace('T', ' ') : raw
   }
@@ -589,6 +595,82 @@ function formatArsCents(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`
 }
 
+export const BOLETERIA_CONDITIONS_TITLE = 'CONDICIONES DE INGRESO Y VALIDEZ'
+
+export const BOLETERIA_CONDITIONS = [
+  'Entrada válida para un (1) único acceso. El código QR será validado en puerta.',
+  'Los códigos QR previamente utilizados no habilitarán un nuevo ingreso. En caso de duplicidad, prevalecerá el primer acceso registrado.',
+  'La organización no se responsabiliza por robo, hurto o extravío de la entrada.',
+  'En caso de extravío, no se garantiza la reimpresión ni el reintegro del importe abonado.',
+]
+
+/** Fuente B (9x17) da 64 columnas en 80 mm; se corta en 56 por si el modelo usa una fuente B más ancha. */
+const CONDITIONS_COLS = 56
+
+/** Ítem con guion y sangría colgante, cortando por palabras. */
+function wrapBullet(text: string, cols: number): string[] {
+  const words = toThermalAscii(text).split(/\s+/).filter(Boolean)
+  const lines: string[] = []
+  let cur = '-'
+  for (const w of words) {
+    if (cur.trim() !== '-' && cur.length + 1 + w.length > cols) {
+      lines.push(cur)
+      cur = `  ${w}`
+    } else {
+      cur += ` ${w}`
+    }
+  }
+  lines.push(cur)
+  return lines
+}
+
+function boleteriaConditionLines(): string[] {
+  return BOLETERIA_CONDITIONS.flatMap((c) => wrapBullet(c, CONDITIONS_COLS))
+}
+
+function conditionsBytes(): Uint8Array {
+  const enc = encoder()
+  return concat([
+    new Uint8Array([ESC, 0x4d, 0x01]),
+    new Uint8Array([ESC, 0x61, 0x01]),
+    new Uint8Array([ESC, 0x45, 0x01]),
+    enc.encode(`${BOLETERIA_CONDITIONS_TITLE}\n`),
+    new Uint8Array([ESC, 0x45, 0x00]),
+    new Uint8Array([ESC, 0x61, 0x00]),
+    enc.encode(`${boleteriaConditionLines().join('\n')}\n`),
+    new Uint8Array([ESC, 0x4d, 0x00]),
+  ])
+}
+
+/** "Boleto Nro 12 de 100" (sin "°": la térmica recibe solo ASCII). */
+function boletoNumberLabel(ticket: BoleteriaTicketRow): string | null {
+  if (!ticket.typeNumber) return null
+  return ticket.typeCapacity
+    ? `Boleto Nro ${ticket.typeNumber} de ${ticket.typeCapacity}`
+    : `Boleto Nro ${ticket.typeNumber}`
+}
+
+function boldLineBytes(text: string): Uint8Array {
+  return concat([
+    new Uint8Array([ESC, 0x45, 0x01]),
+    encoder().encode(`${toThermalAscii(text)}\n`),
+    new Uint8Array([ESC, 0x45, 0x00]),
+  ])
+}
+
+/** Centrado, negrita, doble alto y doble ancho (ESC ! 0x30); ~16 caracteres por línea en 58mm. */
+function bigCenteredBytes(text: string): Uint8Array {
+  return concat([
+    new Uint8Array([ESC, 0x61, 0x01]),
+    new Uint8Array([ESC, 0x45, 0x01]),
+    new Uint8Array([ESC, 0x21, 0x30]),
+    encoder().encode(`${toThermalAscii(text)}\n`),
+    new Uint8Array([ESC, 0x21, 0x00]),
+    new Uint8Array([ESC, 0x45, 0x00]),
+    new Uint8Array([ESC, 0x61, 0x00]),
+  ])
+}
+
 /**
  * QR ESC/POS (Epson GS ( k) con el shortCode — no el token HMAC de la web.
  */
@@ -600,7 +682,7 @@ function qrCodeBytes(payload: string): Uint8Array {
   return concat([
     new Uint8Array([ESC, 0x61, 0x01]),
     new Uint8Array([GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]),
-    new Uint8Array([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x06]),
+    new Uint8Array([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x0a]),
     new Uint8Array([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31]),
     new Uint8Array([GS, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30]),
     data,
@@ -624,22 +706,28 @@ export function buildBoleteriaTicketBytes(ticket: BoleteriaTicketRow): Uint8Arra
     lineBytes(`Lugar: ${ticket.venue || '—'}`),
     lineBytes(''),
     lineBytes(`Tipo: ${ticket.ticketTypeName || '—'}`),
+  ]
+  const numberLabel = boletoNumberLabel(ticket)
+  if (numberLabel) parts.push(boldLineBytes(numberLabel))
+  parts.push(
     lineBytes(`Precio: ${price}`),
     lineBytes(`Pago: ${payment}`),
     lineBytes(''),
     lineBytes(`Titular: ${ticket.buyerName || '—'}`),
-  ]
+  )
   if (ticket.buyerPhone) {
     parts.push(lineBytes(`Tel: ${ticket.buyerPhone}`))
   }
   parts.push(lineBytes(''))
-  parts.push(prominentCenteredAlertBytes(ticket.shortCode || '——'))
+  parts.push(bigCenteredBytes(ticket.shortCode || '--'))
   parts.push(lineBytes(''))
   if (ticket.shortCode) {
     parts.push(qrCodeBytes(ticket.shortCode))
     parts.push(lineBytes(''))
   }
   parts.push(centeredLineBytes('Presentar en puerta'))
+  parts.push(lineBytes(''))
+  parts.push(conditionsBytes())
   parts.push(new Uint8Array([0x0a, 0x0a]))
   parts.push(cutPartial())
   return concat(parts)
@@ -658,6 +746,7 @@ export function buildBoleteriaTicketPreview(ticket: BoleteriaTicketRow): string 
     `Lugar: ${ticket.venue || '—'}`,
     '',
     `Tipo: ${ticket.ticketTypeName || '—'}`,
+    ...(boletoNumberLabel(ticket) ? [boletoNumberLabel(ticket) as string] : []),
     `Precio: ${formatArsCents(ticket.priceCents)}`,
     `Pago: ${payment}`,
     '',
@@ -670,6 +759,9 @@ export function buildBoleteriaTicketPreview(ticket: BoleteriaTicketRow): string 
   lines.push(`[QR: ${ticket.shortCode || '—'}]`)
   lines.push('')
   lines.push('Presentar en puerta')
+  lines.push('')
+  lines.push(BOLETERIA_CONDITIONS_TITLE)
+  lines.push(...boleteriaConditionLines())
   lines.push('')
   lines.push('[Corte parcial]')
   return lines.join('\n')

@@ -17,7 +17,7 @@ class NativeOrderPollerPlugin : Plugin() {
     companion object {
         private const val TAG = "NativeOrderPoller"
         /** Une IDs ya marcados en Android con los que manda JS (evita pisar impresiones nativas si localStorage va atrasado). */
-        private fun mergePrintedIds(prefs: SharedPreferences, incomingJson: String?) {
+        private fun mergePrintedIds(prefs: SharedPreferences, incomingJson: String?, key: String) {
             val merged = LinkedHashSet<String>()
             fun addAll(raw: String?) {
                 try {
@@ -26,11 +26,11 @@ class NativeOrderPollerPlugin : Plugin() {
                 } catch (_: Exception) {
                 }
             }
-            addAll(prefs.getString(RestoPollerPrefs.PRINTED_IDS_KEY, "[]"))
+            addAll(prefs.getString(key, "[]"))
             addAll(incomingJson)
             val out = JSONArray()
             for (id in merged) out.put(id)
-            prefs.edit().putString(RestoPollerPrefs.PRINTED_IDS_KEY, out.toString()).apply()
+            prefs.edit().putString(key, out.toString()).apply()
         }
     }
 
@@ -54,7 +54,7 @@ class NativeOrderPollerPlugin : Plugin() {
             prefs.edit().putString(RestoPollerPrefs.CONFIG_KEY, cfg.toString()).apply()
 
             val printedJson = call.getString("printedIdsJson") ?: "[]"
-            mergePrintedIds(prefs, printedJson)
+            mergePrintedIds(prefs, printedJson, RestoPollerPrefs.printedKeyFor(workMode))
             val rid = call.getString("restaurantId", "") ?: ""
             val host = call.getString("printerHost", "") ?: ""
             Log.i(
@@ -84,14 +84,14 @@ class NativeOrderPollerPlugin : Plugin() {
     @PluginMethod
     fun clearPrintedIds(call: PluginCall) {
         val prefs = context.applicationContext.getSharedPreferences(RestoPollerPrefs.PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(RestoPollerPrefs.PRINTED_IDS_KEY, "[]").apply()
+        prefs.edit().putString(RestoPollerPrefs.printedKey(prefs), "[]").apply()
         call.resolve()
     }
 
     @PluginMethod
     fun getPrintedIdsJson(call: PluginCall) {
         val prefs = context.applicationContext.getSharedPreferences(RestoPollerPrefs.PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(RestoPollerPrefs.PRINTED_IDS_KEY, "[]") ?: "[]"
+        val raw = prefs.getString(RestoPollerPrefs.printedKey(prefs), "[]") ?: "[]"
         val ret = JSObject()
         ret.put("printedIdsJson", raw)
         call.resolve(ret)

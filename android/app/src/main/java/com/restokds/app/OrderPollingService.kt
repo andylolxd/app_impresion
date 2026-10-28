@@ -295,6 +295,16 @@ class OrderPollingService : Service() {
                 return
             }
 
+        val prefs = getSharedPreferences(RestoPollerPrefs.PREFS_NAME, MODE_PRIVATE)
+        val printedKey = RestoPollerPrefs.PRINTED_BOLETERIA_IDS_KEY
+        val printed = loadPrintedIds(prefs, printedKey)
+        val queued = mutableSetOf<String>()
+        for (i in 0 until tickets.length()) {
+            tickets.optJSONObject(i)?.optString("id", "")?.takeIf { it.isNotEmpty() }?.let { queued.add(it) }
+        }
+        // Lo que ya no está en cola quedó confirmado (fisico=false); si vuelve a la cola, se reimprime.
+        if (printed.retainAll(queued)) savePrintedIds(prefs, printed, printedKey)
+
         if (tickets.length() == 0) {
             Log.i(TAG, "boleteria: sin tickets fisico (${System.currentTimeMillis() - t0}ms)")
             return
@@ -313,15 +323,27 @@ class OrderPollingService : Service() {
         val orders = fetchByIds(baseUrl, anon, "Order", orderIds, "id,buyerName,buyerEmail,buyerPhone,paymentMethod,origin")
         val events = fetchByIds(baseUrl, anon, "Event", eventIds, "id,title,startsAt,venue")
         val types = fetchByIds(baseUrl, anon, "TicketType", typeIds, "id,name,priceCents")
+        val numbers = fetchTicketNumbers(baseUrl, anon, queued)
+        if (numbers == null) {
+            Log.e(TAG, "boleteria: sin números de boleto (ticket_print_numbers); se reintenta en el próximo ciclo")
+            return
+        }
 
-        val prefs = getSharedPreferences(RestoPollerPrefs.PREFS_NAME, MODE_PRIVATE)
-        val printed = loadPrintedIds(prefs)
         var printedThisPass = 0
 
         for (i in 0 until tickets.length()) {
             val t = tickets.optJSONObject(i) ?: continue
             val id = t.optString("id", "")
-            if (id.isEmpty() || printed.contains(id)) continue
+            if (id.isEmpty()) continue
+            if (printed.contains(id)) {
+                // Ya impreso pero la marca fisico=false falló: solo se reintenta la marca, nunca se reimprime.
+                if (ackBoleteriaPrinted(baseUrl, anon, id, t.optInt("printCount", 0) + 1)) {
+                    Log.i(TAG, "ack reintentado OK id=${shortId(id)}")
+                } else {
+                    Log.e(TAG, "ack reintento falló id=${shortId(id)} (¿falta permiso UPDATE en Ticket?)")
+                }
+                continue
+            }
 
             val order = orders[t.optString("orderId", "")] ?: continue
             val event = events[t.optString("eventId", "")] ?: continue
@@ -340,6 +362,10 @@ class OrderPollingService : Service() {
                     put("venue", event.optString("venue", ""))
                     put("ticketTypeName", type.optString("name", ""))
                     put("priceCents", type.optInt("priceCents", 0))
+                    numbers[id]?.let { (n, cap) ->
+                        put("typeNumber", n)
+                        put("typeCapacity", cap)
+                    }
                 }
 
             val bytes = EscPosBoleteriaTicket.build(enriched)
@@ -349,15 +375,15 @@ class OrderPollingService : Service() {
                     "TCP boleto ${t.optString("shortCode", shortId(id))} → $printerHost:$printerPort bytes=${bytes.size}",
                 )
                 sendTcp(printerHost, printerPort, bytes)
-                val nextCount = enriched.optInt("printCount", 0) + 1
-                if (!ackBoleteriaPrinted(baseUrl, anon, id, nextCount)) {
-                    Log.e(TAG, "impreso pero ack fisico falló id=${shortId(id)}")
-                    break
-                }
                 printed.add(id)
-                savePrintedIds(prefs, printed)
+                savePrintedIds(prefs, printed, printedKey)
                 printedThisPass++
-                Log.i(TAG, "boleto OK id=${shortId(id)} (${printedThisPass} este ciclo)")
+                val nextCount = enriched.optInt("printCount", 0) + 1
+                if (ackBoleteriaPrinted(baseUrl, anon, id, nextCount)) {
+                    Log.i(TAG, "boleto OK id=${shortId(id)} (${printedThisPass} este ciclo)")
+                } else {
+                    Log.e(TAG, "impreso pero ack fisico falló id=${shortId(id)}; no se reimprime, se reintenta el ack")
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "TCP boleto falló ${shortId(id)}: ${e.message}", e)
                 break
@@ -420,6 +446,49 @@ class OrderPollingService : Service() {
         return map
     }
 
+    /** id → (orden dentro del tipo de entrada, capacidad del tipo); null si la llamada falla. */
+    private fun fetchTicketNumbers(
+        baseUrl: String,
+        anon: String,
+        ids: Set<String>,
+    ): Map<String, Pair<Long, Int>>? {
+        if (ids.isEmpty()) return emptyMap()
+        val payload = JSONObject().put("ticket_ids", JSONArray(ids.toList()))
+        val conn = (URL("$baseUrl/rest/v1/rpc/ticket_print_numbers").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("apikey", anon)
+            setRequestProperty("Authorization", "Bearer $anon")
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+            connectTimeout = 20_000
+            readTimeout = 20_000
+        }
+        return try {
+            conn.outputStream.use { it.write(payload.toString().toByteArray(StandardCharsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream ?: conn.inputStream
+            val body = BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).use { it.readText() }
+            if (code !in 200..299) {
+                Log.e(TAG, "ticket_print_numbers HTTP $code body=${body.take(300)}")
+                return null
+            }
+            val arr = JSONArray(body)
+            val out = mutableMapOf<String, Pair<Long, Int>>()
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val id = row.optString("id", "")
+                if (id.isNotEmpty()) out[id] = row.optLong("typeNumber", 0) to row.optInt("typeCapacity", 0)
+            }
+            out
+        } catch (e: Exception) {
+            Log.e(TAG, "ticket_print_numbers error: ${e.message}", e)
+            null
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     private fun ackBoleteriaPrinted(
         baseUrl: String,
         anon: String,
@@ -427,7 +496,8 @@ class OrderPollingService : Service() {
         nextPrintCount: Int,
     ): Boolean {
         val encId = URLEncoder.encode(ticketId, StandardCharsets.UTF_8.name())
-        val urlStr = "$baseUrl/rest/v1/Ticket?id=eq.$encId&fisico=eq.true"
+        // select=id: anon solo puede leer algunas columnas de Ticket; devolver * da "permission denied".
+        val urlStr = "$baseUrl/rest/v1/Ticket?id=eq.$encId&fisico=eq.true&select=id"
         val payload = JSONObject().apply {
             put("fisico", false)
             put("printCount", nextPrintCount)
@@ -615,8 +685,11 @@ class OrderPollingService : Service() {
         return null
     }
 
-    private fun loadPrintedIds(prefs: android.content.SharedPreferences): MutableSet<String> {
-        val raw = prefs.getString(RestoPollerPrefs.PRINTED_IDS_KEY, "[]") ?: "[]"
+    private fun loadPrintedIds(
+        prefs: android.content.SharedPreferences,
+        key: String = RestoPollerPrefs.PRINTED_IDS_KEY,
+    ): MutableSet<String> {
+        val raw = prefs.getString(key, "[]") ?: "[]"
         return try {
             val arr = JSONArray(raw)
             val s = mutableSetOf<String>()
@@ -629,10 +702,14 @@ class OrderPollingService : Service() {
         }
     }
 
-    private fun savePrintedIds(prefs: android.content.SharedPreferences, ids: Set<String>) {
+    private fun savePrintedIds(
+        prefs: android.content.SharedPreferences,
+        ids: Set<String>,
+        key: String = RestoPollerPrefs.PRINTED_IDS_KEY,
+    ) {
         val arr = JSONArray()
         for (id in ids) arr.put(id)
-        prefs.edit().putString(RestoPollerPrefs.PRINTED_IDS_KEY, arr.toString()).apply()
+        prefs.edit().putString(key, arr.toString()).apply()
     }
 
     private fun sendTcp(host: String, port: Int, bytes: ByteArray) {
