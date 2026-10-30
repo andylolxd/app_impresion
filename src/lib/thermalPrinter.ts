@@ -604,8 +604,37 @@ export const BOLETERIA_CONDITIONS = [
   'En caso de extravío, no se garantiza la reimpresión ni el reintegro del importe abonado.',
 ]
 
-/** Fuente B (9x17) da 64 columnas en 80 mm; se corta en 56 por si el modelo usa una fuente B más ancha. */
-const CONDITIONS_COLS = 56
+/** Área imprimible de 80 mm: 576 puntos = 48 columnas en fuente A (12x24) y 64 en fuente B (9x17). */
+const BOLETO_COLS = 48
+const CONDITIONS_COLS = 64
+
+/** `ESC @` + margen izquierdo 0 (`GS L`) + ancho 576 puntos (`GS W`): sin esto algunas Ocom quedan en 58 mm. */
+function boletoInitBytes(): Uint8Array {
+  return new Uint8Array([ESC, 0x40, GS, 0x4c, 0x00, 0x00, GS, 0x57, 0x40, 0x02])
+}
+
+/** Etiqueta a la izquierda y valor a la derecha; si no entra en una línea, queda "Etiqueta: valor". */
+function boletoRow(label: string, value: string): string {
+  const l = toThermalAscii(`${label}:`)
+  const v = toThermalAscii(value)
+  const gap = BOLETO_COLS - l.length - v.length
+  return gap >= 1 ? `${l}${' '.repeat(gap)}${v}` : `${l} ${v}`
+}
+
+function boletoRule(ch: '-' | '='): string {
+  return ch.repeat(BOLETO_COLS)
+}
+
+/** Centrado, negrita y doble alto (ESC ! 0x18): mantiene el ancho normal para que entre en 48 columnas. */
+function tallCenteredBytes(text: string): Uint8Array {
+  return concat([
+    new Uint8Array([ESC, 0x61, 0x01]),
+    new Uint8Array([ESC, 0x21, 0x18]),
+    encoder().encode(`${toThermalAscii(text)}\n`),
+    new Uint8Array([ESC, 0x21, 0x00]),
+    new Uint8Array([ESC, 0x61, 0x00]),
+  ])
+}
 
 /** Ítem con guion y sangría colgante, cortando por palabras. */
 function wrapBullet(text: string, cols: number): string[] {
@@ -650,6 +679,47 @@ function boletoNumberLabel(ticket: BoleteriaTicketRow): string | null {
     : `Boleto Nro ${ticket.typeNumber}`
 }
 
+function entryLimitLabel(ticket: BoleteriaTicketRow): string | null {
+  return ticket.entryLimit ? boletoRow('Ingreso hasta', formatBoleteriaWhen(ticket.entryLimit)) : null
+}
+
+/** La térmica corta sola las líneas largas; se limita el largo y se aplanan los saltos de línea. */
+function noteLabel(ticket: BoleteriaTicketRow): string | null {
+  const note = ticket.note.replace(/\s+/g, ' ').trim().slice(0, 200)
+  return note ? boletoRow('Nota', note) : null
+}
+
+/** Líneas de cuerpo (sin banner, código grande, QR ni condiciones), compartidas por bytes y preview. */
+type BoletoLine = { text: string; bold?: boolean }
+
+function boletoBodyLines(ticket: BoleteriaTicketRow): { info: BoletoLine[]; buyer: BoletoLine[] } {
+  const payment =
+    PAYMENT_LABEL_BOLETERIA[ticket.paymentMethod] ??
+    (ticket.paymentMethod || '—')
+  const info: BoletoLine[] = [
+    { text: boletoRow('Fecha', formatBoleteriaWhen(ticket.startsAt)) },
+    { text: boletoRow('Lugar', ticket.venue || '—') },
+  ]
+  const limit = entryLimitLabel(ticket)
+  if (limit) info.push({ text: limit, bold: true })
+  info.push({ text: boletoRule('-') }, { text: boletoRow('Tipo', ticket.ticketTypeName || '—') })
+  const number = boletoNumberLabel(ticket)
+  if (number) info.push({ text: boletoRow('Boleto', number.replace(/^Boleto /, '')), bold: true })
+  info.push(
+    { text: boletoRow('Precio', formatArsCents(ticket.priceCents)) },
+    { text: boletoRow('Pago', payment) },
+  )
+  const buyer: BoletoLine[] = [{ text: boletoRow('Titular', ticket.buyerName || '—') }]
+  if (ticket.buyerPhone) buyer.push({ text: boletoRow('Tel', ticket.buyerPhone) })
+  const note = noteLabel(ticket)
+  if (note) buyer.push({ text: note, bold: true })
+  return { info, buyer }
+}
+
+function boletoLineBytes(line: BoletoLine): Uint8Array {
+  return line.bold ? boldLineBytes(line.text) : lineBytes(line.text)
+}
+
 function boldLineBytes(text: string): Uint8Array {
   return concat([
     new Uint8Array([ESC, 0x45, 0x01]),
@@ -658,7 +728,7 @@ function boldLineBytes(text: string): Uint8Array {
   ])
 }
 
-/** Centrado, negrita, doble alto y doble ancho (ESC ! 0x30); ~16 caracteres por línea en 58mm. */
+/** Centrado, negrita, doble alto y doble ancho (ESC ! 0x30); 24 caracteres por línea en 80 mm. */
 function bigCenteredBytes(text: string): Uint8Array {
   return concat([
     new Uint8Array([ESC, 0x61, 0x01]),
@@ -693,40 +763,26 @@ function qrCodeBytes(payload: string): Uint8Array {
 
 /** ESC/POS de una entrada de boletería (1 fila Ticket = 1 corte). */
 export function buildBoleteriaTicketBytes(ticket: BoleteriaTicketRow): Uint8Array {
-  const when = formatBoleteriaWhen(ticket.startsAt)
-  const payment =
-    PAYMENT_LABEL_BOLETERIA[ticket.paymentMethod] ??
-    (ticket.paymentMethod || '—')
-  const price = formatArsCents(ticket.priceCents)
+  const { info, buyer } = boletoBodyLines(ticket)
   const parts: Uint8Array[] = [
-    headerBytes(BOLETERIA_BANNER),
+    boletoInitBytes(),
+    tallCenteredBytes(BOLETERIA_BANNER),
+    lineBytes(boletoRule('=')),
+    tallCenteredBytes(ticket.eventTitle || 'Evento'),
+    lineBytes(boletoRule('-')),
+    ...info.map(boletoLineBytes),
+    lineBytes(boletoRule('-')),
+    ...buyer.map(boletoLineBytes),
+    lineBytes(boletoRule('=')),
+    bigCenteredBytes(ticket.shortCode || '--'),
     lineBytes(''),
-    centeredLineBytes(ticket.eventTitle || 'Evento'),
-    lineBytes(`Fecha: ${when}`),
-    lineBytes(`Lugar: ${ticket.venue || '—'}`),
-    lineBytes(''),
-    lineBytes(`Tipo: ${ticket.ticketTypeName || '—'}`),
   ]
-  const numberLabel = boletoNumberLabel(ticket)
-  if (numberLabel) parts.push(boldLineBytes(numberLabel))
-  parts.push(
-    lineBytes(`Precio: ${price}`),
-    lineBytes(`Pago: ${payment}`),
-    lineBytes(''),
-    lineBytes(`Titular: ${ticket.buyerName || '—'}`),
-  )
-  if (ticket.buyerPhone) {
-    parts.push(lineBytes(`Tel: ${ticket.buyerPhone}`))
-  }
-  parts.push(lineBytes(''))
-  parts.push(bigCenteredBytes(ticket.shortCode || '--'))
-  parts.push(lineBytes(''))
   if (ticket.shortCode) {
     parts.push(qrCodeBytes(ticket.shortCode))
     parts.push(lineBytes(''))
   }
   parts.push(centeredLineBytes('Presentar en puerta'))
-  parts.push(lineBytes(''))
+  parts.push(lineBytes(boletoRule('-')))
   parts.push(conditionsBytes())
   parts.push(new Uint8Array([0x0a, 0x0a]))
   parts.push(cutPartial())
@@ -734,36 +790,27 @@ export function buildBoleteriaTicketBytes(ticket: BoleteriaTicketRow): Uint8Arra
 }
 
 export function buildBoleteriaTicketPreview(ticket: BoleteriaTicketRow): string {
-  const when = formatBoleteriaWhen(ticket.startsAt)
-  const payment =
-    PAYMENT_LABEL_BOLETERIA[ticket.paymentMethod] ??
-    (ticket.paymentMethod || '—')
+  const { info, buyer } = boletoBodyLines(ticket)
   const lines = [
     BOLETERIA_BANNER,
-    '',
+    boletoRule('='),
     ticket.eventTitle || 'Evento',
-    `Fecha: ${when}`,
-    `Lugar: ${ticket.venue || '—'}`,
+    boletoRule('-'),
+    ...info.map((l) => l.text),
+    boletoRule('-'),
+    ...buyer.map((l) => l.text),
+    boletoRule('='),
+    `>>> ${ticket.shortCode || '——'} <<<`,
     '',
-    `Tipo: ${ticket.ticketTypeName || '—'}`,
-    ...(boletoNumberLabel(ticket) ? [boletoNumberLabel(ticket) as string] : []),
-    `Precio: ${formatArsCents(ticket.priceCents)}`,
-    `Pago: ${payment}`,
+    `[QR: ${ticket.shortCode || '—'}]`,
     '',
-    `Titular: ${ticket.buyerName || '—'}`,
+    'Presentar en puerta',
+    boletoRule('-'),
+    BOLETERIA_CONDITIONS_TITLE,
+    ...boleteriaConditionLines(),
+    '',
+    '[Corte parcial]',
   ]
-  if (ticket.buyerPhone) lines.push(`Tel: ${ticket.buyerPhone}`)
-  lines.push('')
-  lines.push(`>>> ${ticket.shortCode || '——'} <<<`)
-  lines.push('')
-  lines.push(`[QR: ${ticket.shortCode || '—'}]`)
-  lines.push('')
-  lines.push('Presentar en puerta')
-  lines.push('')
-  lines.push(BOLETERIA_CONDITIONS_TITLE)
-  lines.push(...boleteriaConditionLines())
-  lines.push('')
-  lines.push('[Corte parcial]')
   return lines.join('\n')
 }
 

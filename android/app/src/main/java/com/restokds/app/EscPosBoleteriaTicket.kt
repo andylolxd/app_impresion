@@ -22,8 +22,9 @@ object EscPosBoleteriaTicket {
         "En caso de extravío, no se garantiza la reimpresión ni el reintegro del importe abonado.",
     )
 
-    /** Fuente B (9x17) da 64 columnas en 80 mm; se corta en 56 por si el modelo usa una fuente B más ancha. */
-    private const val CONDITIONS_COLS = 56
+    /** Área imprimible de 80 mm: 576 puntos = 48 columnas en fuente A (12x24) y 64 en fuente B (9x17). */
+    private const val COLS = 48
+    private const val CONDITIONS_COLS = 64
     private const val TICKET_ZONE = "America/Argentina/Mendoza"
     private val OFFSET_SUFFIX = Regex("(Z|[+-]\\d{2}:?\\d{2})$")
 
@@ -54,17 +55,35 @@ object EscPosBoleteriaTicket {
 
     private fun enc(s: String): ByteArray = toAscii(s).toByteArray(StandardCharsets.US_ASCII)
 
-    private fun header(title: String): ByteArray =
+    /** `ESC @` + margen izquierdo 0 (`GS L`) + ancho 576 puntos (`GS W`): sin esto algunas Ocom quedan en 58 mm. */
+    private fun init(): ByteArray = byteArrayOf(0x1b, 0x40, 0x1d, 0x4c, 0x00, 0x00, 0x1d, 0x57, 0x40, 0x02)
+
+    /** Centrado, negrita y doble alto (ESC ! 0x18): mantiene el ancho normal para que entre en 48 columnas. */
+    private fun tallCentered(text: String): ByteArray =
         concat(
             listOf(
-                byteArrayOf(0x1b, 0x40),
                 byteArrayOf(0x1b, 0x61, 0x01),
-                enc("$title\n"),
+                byteArrayOf(0x1b, 0x21, 0x18),
+                enc("$text\n"),
+                byteArrayOf(0x1b, 0x21, 0x00),
                 byteArrayOf(0x1b, 0x61, 0x00),
             ),
         )
 
+    /** Etiqueta a la izquierda y valor a la derecha; si no entra en una línea, queda "Etiqueta: valor". */
+    private fun row(label: String, value: String): String {
+        val l = toAscii("$label:")
+        val v = toAscii(value)
+        val gap = COLS - l.length - v.length
+        return if (gap >= 1) l + " ".repeat(gap) + v else "$l $v"
+    }
+
+    private fun rule(ch: Char): ByteArray = line(ch.toString().repeat(COLS))
+
     private fun line(text: String): ByteArray = concat(listOf(enc(text), byteArrayOf(0x0a)))
+
+    private fun boldLine(text: String): ByteArray =
+        concat(listOf(byteArrayOf(0x1b, 0x45, 0x01), line(text), byteArrayOf(0x1b, 0x45, 0x00)))
 
     private fun centered(text: String): ByteArray =
         concat(
@@ -186,28 +205,33 @@ object EscPosBoleteriaTicket {
         val phone = ticket.optString("buyerPhone", "")
 
         val parts = mutableListOf<ByteArray>()
-        parts.add(header(BANNER))
-        parts.add(line(""))
-        parts.add(centered(eventTitle.ifBlank { "Evento" }))
-        parts.add(line("Fecha: $whenStr"))
-        parts.add(line("Lugar: $venue"))
-        parts.add(line(""))
-        parts.add(line("Tipo: $typeName"))
+        parts.add(init())
+        parts.add(tallCentered(BANNER))
+        parts.add(rule('='))
+        parts.add(tallCentered(eventTitle.ifBlank { "Evento" }))
+        parts.add(rule('-'))
+        parts.add(line(row("Fecha", whenStr)))
+        parts.add(line(row("Lugar", venue)))
+        val entryLimit = ticket.optString("entryLimit", "")
+        if (entryLimit.isNotBlank()) parts.add(boldLine(row("Ingreso hasta", formatWhen(entryLimit))))
+        parts.add(rule('-'))
+        parts.add(line(row("Tipo", typeName)))
         val typeNumber = ticket.optLong("typeNumber", 0)
         val typeCapacity = ticket.optInt("typeCapacity", 0)
         if (typeNumber > 0) {
             // "Nro" y no "N°": la térmica recibe solo ASCII.
-            val label = if (typeCapacity > 0) "Boleto Nro $typeNumber de $typeCapacity" else "Boleto Nro $typeNumber"
-            parts.add(byteArrayOf(0x1b, 0x45, 0x01))
-            parts.add(line(label))
-            parts.add(byteArrayOf(0x1b, 0x45, 0x00))
+            val label = if (typeCapacity > 0) "Nro $typeNumber de $typeCapacity" else "Nro $typeNumber"
+            parts.add(boldLine(row("Boleto", label)))
         }
-        parts.add(line("Precio: ${formatPrice(priceCents)}"))
-        parts.add(line("Pago: $payment"))
-        parts.add(line(""))
-        parts.add(line("Titular: $buyer"))
-        if (phone.isNotBlank()) parts.add(line("Tel: $phone"))
-        parts.add(line(""))
+        parts.add(line(row("Precio", formatPrice(priceCents))))
+        parts.add(line(row("Pago", payment)))
+        parts.add(rule('-'))
+        parts.add(line(row("Titular", buyer)))
+        if (phone.isNotBlank()) parts.add(line(row("Tel", phone)))
+        // La térmica corta sola las líneas largas; se limita el largo y se aplanan los saltos de línea.
+        val note = ticket.optString("note", "").replace(Regex("\\s+"), " ").trim().take(200)
+        if (note.isNotEmpty()) parts.add(boldLine(row("Nota", note)))
+        parts.add(rule('='))
         parts.add(prominent(shortCode.ifBlank { "--" }))
         parts.add(line(""))
         if (shortCode.isNotBlank()) {
@@ -215,7 +239,7 @@ object EscPosBoleteriaTicket {
             parts.add(line(""))
         }
         parts.add(centered("Presentar en puerta"))
-        parts.add(line(""))
+        parts.add(rule('-'))
         parts.add(conditions())
         parts.add(byteArrayOf(0x0a, 0x0a))
         parts.add(cutPartial())

@@ -280,7 +280,7 @@ class OrderPollingService : Service() {
 
         val select =
             URLEncoder.encode(
-                "id,shortCode,status,fisico,printCount,createdAt,orderId,eventId,ticketTypeId",
+                "id,shortCode,status,fisico,printCount,createdAt,orderId,eventId,ticketTypeId,note,validUntil",
                 StandardCharsets.UTF_8.name(),
             )
         val urlStr =
@@ -322,7 +322,7 @@ class OrderPollingService : Service() {
 
         val orders = fetchByIds(baseUrl, anon, "Order", orderIds, "id,buyerName,buyerEmail,buyerPhone,paymentMethod,origin")
         val events = fetchByIds(baseUrl, anon, "Event", eventIds, "id,title,startsAt,venue")
-        val types = fetchByIds(baseUrl, anon, "TicketType", typeIds, "id,name,priceCents")
+        val types = fetchByIds(baseUrl, anon, "TicketType", typeIds, "id,name,priceCents,entryUntil")
         val numbers = fetchTicketNumbers(baseUrl, anon, queued)
         if (numbers == null) {
             Log.e(TAG, "boleteria: sin números de boleto (ticket_print_numbers); se reintenta en el próximo ciclo")
@@ -362,6 +362,11 @@ class OrderPollingService : Service() {
                     put("venue", event.optString("venue", ""))
                     put("ticketTypeName", type.optString("name", ""))
                     put("priceCents", type.optInt("priceCents", 0))
+                    put("note", if (t.isNull("note")) "" else t.optString("note", ""))
+                    // El límite propio de la entrada manda; si no tiene, vale el del tipo.
+                    val validUntil = if (t.isNull("validUntil")) "" else t.optString("validUntil", "")
+                    val entryUntil = if (type.isNull("entryUntil")) "" else type.optString("entryUntil", "")
+                    put("entryLimit", validUntil.ifBlank { entryUntil })
                     numbers[id]?.let { (n, cap) ->
                         put("typeNumber", n)
                         put("typeCapacity", cap)

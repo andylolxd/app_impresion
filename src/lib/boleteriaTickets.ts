@@ -21,6 +21,10 @@ export type BoleteriaTicketRow = {
   /** Orden de emisión dentro del tipo de entrada (función ticket_print_numbers). */
   typeNumber: number | null
   typeCapacity: number | null
+  /** Observación de la entrada (ej. "Mesa 4"); vacío si no tiene. */
+  note: string
+  /** Hasta cuándo se puede ingresar: validUntil de la entrada o, si no tiene, entryUntil del tipo. */
+  entryLimit: string
 }
 
 type TicketDbRow = {
@@ -33,6 +37,8 @@ type TicketDbRow = {
   orderId: string
   eventId: string
   ticketTypeId: string
+  note: string | null
+  validUntil: string | null
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -62,7 +68,7 @@ export async function fetchFisicoTickets(
   const { data, error } = await supabase
     .from('Ticket')
     .select(
-      'id, shortCode, status, fisico, printCount, createdAt, orderId, eventId, ticketTypeId',
+      'id, shortCode, status, fisico, printCount, createdAt, orderId, eventId, ticketTypeId, note, validUntil',
     )
     .eq('fisico', true)
     .eq('status', 'VALIDO')
@@ -91,7 +97,7 @@ export async function fetchFisicoTickets(
       ? supabase.from('Event').select('id, title, startsAt, venue').in('id', eventIds)
       : Promise.resolve({ data: [], error: null }),
     typeIds.length
-      ? supabase.from('TicketType').select('id, name, priceCents').in('id', typeIds)
+      ? supabase.from('TicketType').select('id, name, priceCents, entryUntil').in('id', typeIds)
       : Promise.resolve({ data: [], error: null }),
     supabase.rpc('ticket_print_numbers', { ticket_ids: tickets.map((t) => t.id) }),
   ])
@@ -152,6 +158,8 @@ export async function fetchFisicoTickets(
       priceCents: num(tt.priceCents, 0),
       typeNumber: numbers.get(t.id)?.typeNumber ?? null,
       typeCapacity: numbers.get(t.id)?.typeCapacity ?? null,
+      note: str(t.note).trim(),
+      entryLimit: str(t.validUntil) || str(tt.entryUntil),
     })
   }
 
